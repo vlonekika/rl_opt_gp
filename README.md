@@ -441,20 +441,6 @@ curl http://localhost:8000/sessions
 curl -X DELETE http://localhost:8000/sessions/987654321
 ```
 
-### Тестовый клиент
-
-В проекте есть готовый тестовый клиент для симуляции игровых сессий:
-
-```bash
-python example_client.py
-```
-
-Клиент:
-- Проверяет доступность сервиса
-- Симулирует 3 игровые сессии с разной длительностью (5-15 минут)
-- Отправляет события init, snapshot (каждую минуту), reward (ButtonShown, CLICKED, PAID)
-- Показывает статистику MAB до и после тестирования
-
 ## Docker
 
 ### Dockerfile
