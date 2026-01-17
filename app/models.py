@@ -73,5 +73,7 @@ class AdRewardResponse(BaseModel):
     """Ответ сервиса с размером награды за рекламу"""
     session_id: int
     appmetrica_device_id: int
+    reward_source: str
+    recommended_coefficient: float = Field(..., ge=0, le=8)
     recommended_reward: int = Field(..., ge=0)
     game_minute: int
