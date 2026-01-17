@@ -171,6 +171,8 @@ async def handle_init_event(event: InitEvent):
     return AdRewardResponse(
         session_id=event.session_id,
         appmetrica_device_id=event.appmetrica_device_id,
+        reward_source="mab",
+        recommended_coefficient=coefficient,
         recommended_reward=recommended_reward,
         game_minute=0
     )
@@ -219,6 +221,8 @@ async def handle_snapshot_event(event: UserSnapshotActiveState, background_tasks
     return AdRewardResponse(
         session_id=event.session_id,
         appmetrica_device_id=event.appmetrica_device_id,
+        reward_source="mab",
+        recommended_coefficient=coefficient,
         recommended_reward=recommended_reward,
         game_minute=event.game_minute
     )
