@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Literal
 
@@ -13,10 +13,6 @@ class BaseEvent(BaseModel):
     country_iso_code: str
     appmetrica_device_id: int = Field(..., ge=0)
     session_id: int
-
-    @validator('appmetrica_device_id', pre=True)
-    def parse_int_str(cls, v):
-        return int(v)
 
 
 class InitEvent(BaseEvent):
@@ -67,10 +63,6 @@ class UserSnapshotActiveState(BaseEvent):
     hard_balance: float = Field(0, ge=0)
     hard_revenue_last_minute: float = Field(0, ge=0)
     itemtoken_ad_reward_calculate: float = Field(0, ge=0)
-
-    @validator('money_balance', 'player_dps', pre=True)
-    def parse_float_str(cls, v):
-        return float(v)
 
 
 class RewardEvent(BaseEvent):
