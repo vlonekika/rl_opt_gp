@@ -217,7 +217,7 @@ async def handle_init_event(event: InitEvent):
         return AdRewardResponse(
             session_id=event.session_id,
             appmetrica_device_id=event.appmetrica_device_id,
-            reward_source="uplift",
+            reward_source="default",
             recommended_coefficient=coefficient,
             recommended_reward=recommended_reward,
             game_minute=0
