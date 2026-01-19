@@ -1,8 +1,7 @@
 from fastapi import FastAPI
 from typing import Dict
 import logging
-from datetime import datetime, timedelta
-import asyncio
+from datetime import datetime
 import pickle
 
 from catboost import CatBoostClassifier, Pool
@@ -41,93 +40,11 @@ with open("app/ml_models_pkl/ad_model_drop_device.pkl", "rb") as file:
 
 ad_prob_model_features = ad_prob_model.feature_names_
 
-# Хранилище активных сессий: session_id -> SessionState
-active_sessions: Dict[int, SessionState] = {}
+# Хранилище init_data для uplift группы: session_id -> init_event_data
+session_init_data: Dict[int, Dict] = {}
 
-# Хранилище коэффициентов по минутам: session_id -> {game_minute -> coefficient}
-# Необходимо для связи PAID события с правильным коэффициентом
-session_coefficients: Dict[int, Dict[int, float]] = {}
-
-# Таймаут неактивности сессии (в минутах)
-SESSION_INACTIVITY_TIMEOUT = 10
 GROUPS = ["default", "mab", "uplift"]
 SALT = "v1"
-
-
-def close_session_internal(session_id: int) -> Dict:
-    """
-    Внутренняя функция для закрытия сессии и обучения MAB.
-    Используется как из API эндпоинта, так и из фоновой задачи.
-    """
-    if session_id not in active_sessions:
-        return None
-
-    session = active_sessions[session_id]
-    total_ads = session.total_ads_watched
-
-    logger.info(
-        f"Session {session_id} closed. "
-        f"Total ads watched: {total_ads}"
-    )
-
-    # ОБУЧЕНИЕ MAB: обновляем каждый коэффициент, использованный в сессии
-    for coefficient in session.coefficients_used:
-        mab_agent.update(coefficient, total_ads)
-        logger.info(
-            f"MAB session-end update: coefficient={coefficient}, "
-            f"ads_watched={total_ads}"
-        )
-
-    # Удаляем сессию и связанные данные
-    del active_sessions[session_id]
-    if session_id in session_coefficients:
-        del session_coefficients[session_id]
-
-    return {
-        "status": "session_closed",
-        "session_id": session_id,
-        "total_ads_watched": total_ads
-    }
-
-
-async def cleanup_inactive_sessions():
-    """
-    Фоновая задача для автоматического закрытия неактивных сессий.
-    Запускается каждые 60 секунд и проверяет сессии без активности > 10 минут.
-    """
-    while True:
-        try:
-            await asyncio.sleep(60)  # Проверяем каждую минуту
-
-            now = datetime.now()
-            inactive_sessions = []
-
-            # Находим неактивные сессии
-            for session_id, session in active_sessions.items():
-                if session.last_activity_time is None:
-                    continue
-
-                inactive_duration = now - session.last_activity_time
-                if inactive_duration > timedelta(minutes=SESSION_INACTIVITY_TIMEOUT):
-                    inactive_sessions.append(session_id)
-
-            # Закрываем неактивные сессии
-            for session_id in inactive_sessions:
-                logger.info(
-                    f"Auto-closing inactive session {session_id} "
-                    f"(no activity for {SESSION_INACTIVITY_TIMEOUT} minutes)"
-                )
-                close_session_internal(session_id)
-
-        except Exception as e:
-            logger.error(f"Error in cleanup_inactive_sessions: {e}")
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Запуск фоновых задач при старте приложения"""
-    asyncio.create_task(cleanup_inactive_sessions())
-    logger.info(f"Started inactive session cleanup task (timeout: {SESSION_INACTIVITY_TIMEOUT} minutes)")
 
 
 @app.get("/")
@@ -155,11 +72,6 @@ async def handle_init_event(event: InitEvent):
     """
     logger.info(f"Init event received for session {event.session_id}, device {event.appmetrica_device_id}")
 
-    # Создаем новую сессию
-    session = SessionState(event.session_id, event.appmetrica_device_id)
-    session.add_init_event(event.model_dump())
-    active_sessions[event.session_id] = session
-
     split_group_id = user_splitter(
         user_id=event.appmetrica_device_id,
         n_buckets=len(GROUPS),
@@ -167,15 +79,13 @@ async def handle_init_event(event: InitEvent):
     )
     reward_source = GROUPS[split_group_id]
 
+    # Сохраняем init_data для uplift группы
+    if reward_source == "uplift":
+        session_init_data[event.session_id] = event.model_dump()
+
     if reward_source == "mab":
         # MAB выбирает коэффициент
         coefficient = mab_agent.select_action()
-
-        # Инициализируем хранилище коэффициентов для этой сессии
-        session_coefficients[event.session_id] = {0: coefficient}
-
-        # Сохраняем коэффициент в сессии для финального обучения
-        session.coefficients_used.add(coefficient)
 
         # Дефолтное значение награды (будет обновлено при первом snapshot)
         default_reward = 1000
@@ -232,18 +142,6 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
     """
     logger.info(f"Snapshot event received for session {event.session_id}, minute {event.game_minute}")
 
-    # Проверяем существование сессии
-    if event.session_id not in active_sessions:
-        logger.warning(f"Session {event.session_id} not found, creating new session")
-        # Создаем сессию если её нет (хотя должна была быть создана через init)
-        session = SessionState(event.session_id, event.appmetrica_device_id)
-        active_sessions[event.session_id] = session
-    else:
-        session = active_sessions[event.session_id]
-
-    # Добавляем snapshot в историю (обучение MAB происходит в конце сессии)
-    session.add_snapshot(event.model_dump())
-
     split_group_id = user_splitter(
         user_id=event.appmetrica_device_id,
         n_buckets=len(GROUPS),
@@ -258,14 +156,6 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
         # Рассчитываем рекомендованную награду = coefficient * money_ad_reward_calculate
         base_reward = event.money_ad_reward_calculate
         recommended_reward = int(coefficient * base_reward)
-
-        # Сохраняем коэффициент с привязкой к минуте
-        if event.session_id not in session_coefficients:
-            session_coefficients[event.session_id] = {}
-        session_coefficients[event.session_id][event.game_minute] = coefficient
-
-        # Сохраняем коэффициент в сессии для финального обучения
-        session.coefficients_used.add(coefficient)
 
         logger.info(
             f"Session {event.session_id}, minute {event.game_minute}: "
@@ -282,8 +172,9 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
         )
     
     elif reward_source == "uplift":
-
-        state = event.model_dump() | session.init_data
+        # Получаем init_data для uplift модели
+        init_data = session_init_data.get(event.session_id, {})
+        state = event.model_dump() | init_data
         fe_state = state_fe_standart(state)
 
         prob = ad_prob_model.predict_proba(
@@ -339,15 +230,23 @@ async def handle_reward_event(event: RewardEvent):
         f"coefficient {event.recommended_coefficient}, reward {event.recommended_reward}"
     )
 
-    # Обучаем MAB на основе результата
-    clicked = (event.event_type == "CLICKED")
-    mab_agent.update(event.recommended_coefficient, clicked)
+    if event.reward_source == "mab":
+        # Обучаем MAB на основе результата
+        clicked = (event.event_type == "CLICKED")
+        mab_agent.update(event.recommended_coefficient, clicked)
+
+        return {
+            "status": "ok",
+            "session_id": event.session_id,
+            "event_type": event.event_type,
+            "mab_updated": True
+        }
 
     return {
         "status": "ok",
         "session_id": event.session_id,
         "event_type": event.event_type,
-        "mab_updated": True
+        "mab_updated": False
     }
 
 
