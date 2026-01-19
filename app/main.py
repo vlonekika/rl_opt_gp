@@ -9,7 +9,8 @@ from app.ml_tools import state_fe_standart, reward
 from app.ab_user_splitter import user_splitter
 
 from app.models import InitEvent, UserSnapshotActiveState, RewardEvent, AdRewardResponse
-from app.rl_agent import RLAgent
+from app.rl_agent import LinUCB
+import numpy as np
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,13 +26,12 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Multi-Armed Bandit для оптимизации коэффициента награды за рекламу
-# Обучается на каждом единичном REWARD событии (CLICKED/IGNORED)
-mab_agent = RLAgent(
+# LinUCB контекстный бандит для оптимизации коэффициента награды за рекламу
+# Использует состояние игрока (контекст) для более точного подбора коэффициента
+linucb_agent = LinUCB(
     coefficients=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-    epsilon=0.1,
-    epsilon_decay=0.999,
-    min_epsilon=0.01,
+    context_dim=20,
+    alpha=1.0,
     penalty_weight=0.1
 )
 
@@ -43,6 +43,10 @@ ad_prob_model_features = ad_prob_model.feature_names_
 # Хранилище init_data для uplift группы: session_id -> init_event_data
 session_init_data: Dict[int, Dict] = {}
 
+# Хранилище контекстов для LinUCB: (session_id, PlayTimeMinutes) -> context_vector
+# Используем PlayTimeMinutes как ключ для связи snapshot событий с reward событиями
+session_contexts: Dict[tuple, np.ndarray] = {}
+
 GROUPS = ["default", "mab", "uplift"]
 SALT = "v1"
 
@@ -51,10 +55,10 @@ SALT = "v1"
 async def root():
     """Информация о сервисе"""
     return {
-        "service": "Multi-Armed Bandit Ad Reward Optimization",
+        "service": "LinUCB Ad Reward Optimization",
         "status": "running",
         "version": "1.0.0",
-        "mab_stats": mab_agent.get_stats()
+        "linucb_stats": linucb_agent.get_stats()
     }
 
 
@@ -84,10 +88,8 @@ async def handle_init_event(event: InitEvent):
         session_init_data[event.session_id] = event.model_dump()
 
     if reward_source == "mab":
-        # MAB выбирает коэффициент
-        coefficient = mab_agent.select_action()
-
-        # Дефолтное значение награды (будет обновлено при первом snapshot)
+        # Возвращаем дефолтное значение (будет обновлено при первом snapshot с контекстом)
+        coefficient = 1.0
         default_reward = 1000
         recommended_reward = int(coefficient * default_reward)
 
@@ -137,7 +139,7 @@ async def handle_init_event(event: InitEvent):
 @app.post("/events/snapshot", response_model=AdRewardResponse)
 async def handle_snapshot_event(event: UserSnapshotActiveState):
     """
-    Обрабатывает user_snapshot_active_state - минутный срез состояния игрока.
+    Обрабатыва��т user_snapshot_active_state - минутный срез состояния игрока.
     Использует MAB агента для определения оптимальной награды за рекламу.
     """
     logger.info(f"Snapshot event received for session {event.session_id}, minute {event.game_minute}")
@@ -150,8 +152,15 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
     reward_source = GROUPS[split_group_id]
 
     if reward_source == "mab":
-        # MAB выбирает коэффициент для следующей минуты
-        coefficient = mab_agent.select_action()
+        # Извлекаем контекст из состояния игрока
+        context = LinUCB.extract_context(event.model_dump())
+
+        # Сохраняем контекст с ключом (session_id, game_minute)
+        # game_minute будет использован для сопоставления с PlayTimeMinutes в reward событии
+        session_contexts[(event.session_id, event.game_minute)] = context
+
+        # LinUCB выбирает коэффициент на основе контекста
+        coefficient = linucb_agent.select_action(context)
 
         # Рассчитываем рекомендованную награду = coefficient * money_ad_reward_calculate
         base_reward = event.money_ad_reward_calculate
@@ -159,7 +168,7 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
 
         logger.info(
             f"Session {event.session_id}, minute {event.game_minute}: "
-            f"coefficient={coefficient}, base_reward={base_reward}, recommended_reward={recommended_reward}"
+            f"LinUCB coefficient={coefficient}, base_reward={base_reward}, recommended_reward={recommended_reward}"
         )
 
         return AdRewardResponse(
@@ -231,16 +240,44 @@ async def handle_reward_event(event: RewardEvent):
     )
 
     if event.reward_source == "mab":
-        # Обучаем MAB на основе результата
         clicked = (event.event_type == "CLICKED")
-        mab_agent.update(event.recommended_coefficient, clicked)
 
-        return {
-            "status": "ok",
-            "session_id": event.session_id,
-            "event_type": event.event_type,
-            "mab_updated": True
-        }
+        # Получаем контекст по ключу (session_id, PlayTimeMinutes)
+        context_key = (event.session_id, event.PlayTimeMinutes)
+        context = session_contexts.get(context_key)
+
+        if context is not None:
+            # Обучаем LinUCB на основе контекста и результата
+            linucb_agent.update(event.recommended_coefficient, context, clicked)
+
+            # Удаляем контекст после использования для экономии памяти
+            del session_contexts[context_key]
+
+            logger.info(
+                f"LinUCB updated for session {event.session_id}, PlayTimeMinutes={event.PlayTimeMinutes}, "
+                f"coefficient={event.recommended_coefficient}, clicked={clicked}"
+            )
+
+            return {
+                "status": "ok",
+                "session_id": event.session_id,
+                "event_type": event.event_type,
+                "linucb_updated": True
+            }
+        else:
+            # Контекст не найден - возможно, событие пришло раньше snapshot или после очистки
+            logger.warning(
+                f"Context not found for session {event.session_id}, PlayTimeMinutes={event.PlayTimeMinutes}. "
+                f"LinUCB update skipped."
+            )
+
+            return {
+                "status": "ok",
+                "session_id": event.session_id,
+                "event_type": event.event_type,
+                "linucb_updated": False,
+                "reason": "context_not_found"
+            }
 
     return {
         "status": "ok",
@@ -252,8 +289,11 @@ async def handle_reward_event(event: RewardEvent):
 
 @app.get("/agent/stats")
 async def get_agent_stats():
-    """Возвращает статистику MAB агента"""
-    return mab_agent.get_stats()
+    """Возвращает статистику LinUCB агента"""
+    return {
+        "linucb": linucb_agent.get_stats(),
+        "session_contexts_count": len(session_contexts)
+    }
 
 
 if __name__ == "__main__":

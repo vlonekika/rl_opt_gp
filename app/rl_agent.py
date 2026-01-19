@@ -374,7 +374,3 @@ class LinUCB:
             (snapshot.get('shop_activity_last_minute', 0) +
              snapshot.get('upgrade_activity_last_minute', 0)) / 10.0,
         ], dtype=np.float64)
-
-
-# Алиас для обратной совместимости
-RLAgent = MultiArmedBandit
