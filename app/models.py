@@ -12,7 +12,7 @@ class BaseEvent(BaseModel):
     connection_type: Literal["cell", "wifi"]
     country_iso_code: str
     appmetrica_device_id: int = Field(..., ge=0)
-    session_id: int
+    session_id: int = Field(..., ge=0)
 
 
 class InitEvent(BaseEvent):
@@ -78,8 +78,6 @@ class RewardEvent(BaseEvent):
 
 class AdRewardResponse(BaseModel):
     """Ответ сервиса с размером награды за рекламу"""
-    session_id: int
-    appmetrica_device_id: int
     reward_source: str
     recommended_coefficient: float = Field(..., ge=0, le=8)
     recommended_reward: int = Field(..., ge=0)

@@ -40,10 +40,10 @@ with open("app/ml_models_pkl/ad_model_drop_device.pkl", "rb") as file:
 
 ad_prob_model_features = ad_prob_model.feature_names_
 
-# Хранилище init_data для uplift группы: session_id -> init_event_data
-session_init_data: Dict[int, Dict] = {}
+# Хранилище init_data для uplift группы: (appmetrica_device_id, session_id) -> init_event_data
+session_init_data: Dict[tuple, Dict] = {}
 
-# Хранилище контекстов для LinUCB: (session_id, PlayTimeMinutes) -> context_vector
+# Хранилище контекстов для LinUCB: (appmetrica_device_id, session_id, PlayTimeMinutes) -> context_vector
 # Используем PlayTimeMinutes как ключ для связи snapshot событий с reward событиями
 session_contexts: Dict[tuple, np.ndarray] = {}
 
@@ -85,7 +85,8 @@ async def handle_init_event(event: InitEvent):
 
     # Сохраняем init_data для uplift группы
     if reward_source == "uplift":
-        session_init_data[event.session_id] = event.model_dump()
+        session_key = (event.appmetrica_device_id, event.session_id)
+        session_init_data[session_key] = event.model_dump()
 
     if reward_source == "mab":
         # Возвращаем дефолтное значение (будет обновлено при первом snapshot с контекстом)
@@ -155,9 +156,10 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
         # Извлекаем контекст из состояния игрока
         context = LinUCB.extract_context(event.model_dump())
 
-        # Сохраняем контекст с ключом (session_id, game_minute)
+        # Сохраняем контекст с ключом (appmetrica_device_id, session_id, game_minute)
         # game_minute будет использован для сопоставления с PlayTimeMinutes в reward событии
-        session_contexts[(event.session_id, event.game_minute)] = context
+        context_key = (event.appmetrica_device_id, event.session_id, event.game_minute)
+        session_contexts[context_key] = context
 
         # LinUCB выбирает коэффициент на основе контекста
         coefficient = linucb_agent.select_action(context)
@@ -182,7 +184,8 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
     
     elif reward_source == "uplift":
         # Получаем init_data для uplift модели
-        init_data = session_init_data.get(event.session_id, {})
+        session_key = (event.appmetrica_device_id, event.session_id)
+        init_data = session_init_data.get(session_key, {})
         state = event.model_dump() | init_data
         fe_state = state_fe_standart(state)
 
@@ -242,8 +245,8 @@ async def handle_reward_event(event: RewardEvent):
     if event.reward_source == "mab":
         clicked = (event.event_type == "CLICKED")
 
-        # Получаем контекст по ключу (session_id, PlayTimeMinutes)
-        context_key = (event.session_id, event.PlayTimeMinutes)
+        # Получаем контекст по ключу (appmetrica_device_id, session_id, PlayTimeMinutes)
+        context_key = (event.appmetrica_device_id, event.session_id, event.PlayTimeMinutes)
         context = session_contexts.get(context_key)
 
         if context is not None:
@@ -254,8 +257,8 @@ async def handle_reward_event(event: RewardEvent):
             del session_contexts[context_key]
 
             logger.info(
-                f"LinUCB updated for session {event.session_id}, PlayTimeMinutes={event.PlayTimeMinutes}, "
-                f"coefficient={event.recommended_coefficient}, clicked={clicked}"
+                f"LinUCB updated for device {event.appmetrica_device_id}, session {event.session_id}, "
+                f"PlayTimeMinutes={event.PlayTimeMinutes}, coefficient={event.recommended_coefficient}, clicked={clicked}"
             )
 
             return {
@@ -267,8 +270,8 @@ async def handle_reward_event(event: RewardEvent):
         else:
             # Контекст не найден - возможно, событие пришло раньше snapshot или после очистки
             logger.warning(
-                f"Context not found for session {event.session_id}, PlayTimeMinutes={event.PlayTimeMinutes}. "
-                f"LinUCB update skipped."
+                f"Context not found for device {event.appmetrica_device_id}, session {event.session_id}, "
+                f"PlayTimeMinutes={event.PlayTimeMinutes}. LinUCB update skipped."
             )
 
             return {
