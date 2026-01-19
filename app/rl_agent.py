@@ -1,84 +1,9 @@
 import numpy as np
-from typing import Dict, Optional
-from collections import defaultdict
+from typing import Dict
 import logging
 import threading
 
 logger = logging.getLogger(__name__)
-
-
-class SessionState:
-    """Хранит состояние игровой сессии пользователя"""
-
-    def __init__(self, session_id: int, device_id: int):
-        self.session_id = session_id
-        self.device_id = device_id
-        self.init_data: Optional[Dict] = None
-        self.snapshots = []
-        self.reward_events = []
-        self.total_ads_watched = 0
-        self.current_game_minute = 0
-        self.last_snapshot = None
-        # Для обучения MAB: какие коэффициенты использовались в этой сессии
-        self.coefficients_used = set()  # Уникальные коэффициенты, показанные в сессии
-        # Время последней активности для автоматического закрытия
-        self.last_activity_time = None
-
-    def add_init_event(self, event_data: Dict):
-        """Сохраняет данные init события"""
-        from datetime import datetime
-        self.init_data = event_data
-        self.last_activity_time = datetime.now()
-
-    def add_snapshot(self, snapshot_data: Dict):
-        """Добавляет snapshot в историю"""
-        from datetime import datetime
-        self.snapshots.append(snapshot_data)
-        self.last_snapshot = snapshot_data
-        self.current_game_minute = snapshot_data.get('game_minute', 0)
-        self.last_activity_time = datetime.now()
-
-    def add_reward_event(self, event_data: Dict):
-        """Добавляет событие рекламы (CLICKED/IGNORED)"""
-        from datetime import datetime
-        self.reward_events.append(event_data)
-        # CLICKED означает что пользователь посмотрел рекламу
-        if event_data.get('event_type') == 'CLICKED':
-            self.total_ads_watched += 1
-        self.last_activity_time = datetime.now()
-
-    def get_state_vector(self) -> np.ndarray:
-        """
-        Формирует вектор состояния для RL агента
-        Включает ключевые метрики из последнего snapshot и init данных
-        """
-        if not self.last_snapshot or not self.init_data:
-            return np.zeros(20)
-
-        features = [
-            self.current_game_minute,
-            self.last_snapshot.get('ad_cnt', 0),
-            self.last_snapshot.get('death_cnt', 0),
-            self.last_snapshot.get('money_balance', 0) / 10000,  # нормализация
-            self.last_snapshot.get('health_ratio', 0),
-            self.last_snapshot.get('kills_last_minute', 0),
-            self.last_snapshot.get('boss_kills_last_minute', 0),
-            self.last_snapshot.get('money_revenue_last_minute', 0) / 1000,
-            self.last_snapshot.get('player_dps', 0) / 100,
-            self.last_snapshot.get('hardness_calculate', 0),
-            self.last_snapshot.get('damage_lvl', 0) / 10,
-            self.last_snapshot.get('health_lvl', 0) / 10,
-            self.total_ads_watched,
-            self.init_data.get('session_cnt', 0) / 100,
-            self.init_data.get('avg_playtime_lifetime', 0) / 3600,
-            self.init_data.get('ad_views_cnt', 0) / 100,
-            self.last_snapshot.get('upgrade_activity_last_minute', 0),
-            self.last_snapshot.get('shop_activity_last_minute', 0),
-            self.last_snapshot.get('health_change_last_minute', 0) / 100,
-            self.last_snapshot.get('itemtoken_balance', 0) / 100,
-        ]
-
-        return np.array(features, dtype=np.float32)
 
 
 class MultiArmedBandit:
@@ -86,7 +11,7 @@ class MultiArmedBandit:
     Epsilon-Greedy Multi-Armed Bandit для оптимизации коэффициента награды за рекламу.
     Каждая "рука" (arm) соответствует коэффициенту к money_ad_reward_calculate.
 
-    Оптимизирует: конверсию в просмотр рекламы - штраф за высокие коэффициенты.
+    Обучается на каждом единичном REWARD событии (CLICKED/IGNORED).
     """
 
     def __init__(
@@ -149,31 +74,32 @@ class MultiArmedBandit:
         logger.debug(f"Exploitation: selected best coefficient {best_arm} (avg reward: {self.arm_stats[best_arm]['avg_reward']:.3f})")
         return float(best_arm)
 
-    def update(self, action: float, ads_watched: int):
+    def update(self, coefficient: float, clicked: bool):
         """
-        Обновляет статистику выбранного коэффициента на основе конверсии.
+        Обновляет статистику выбранного коэффициента на основе единичного события.
         Thread-safe для конкурентных обновлений от нескольких игроков.
 
-        Reward = ads_watched - penalty * coefficient
-        Штрафуем за высокие коэффициенты (вредят экономике игры).
+        Reward:
+        - CLICKED: 1.0 - penalty * coefficient (пользователь посмотрел рекламу)
+        - IGNORED: 0.0 - penalty * coefficient (пользователь отклонил)
 
         Args:
-            action: Выбранный коэффициент награды
-            ads_watched: Количество просмотренных реклам в сессии
+            coefficient: Коэффициент награды, который был предложен
+            clicked: True если CLICKED, False если IGNORED
         """
-        if action not in self.arms:
-            logger.warning(f"Unknown coefficient {action}, skipping update")
+        if coefficient not in self.arms:
+            logger.warning(f"Unknown coefficient {coefficient}, skipping update")
             return
 
-        # Рассчитываем reward с штрафом за высокий коэффициент
-        # reward = конверсия - штраф за высокую награду
-        penalty = self.penalty_weight * action
-        reward = float(ads_watched) - penalty
+        # Рассчитываем reward
+        penalty = self.penalty_weight * coefficient
+        base_reward = 1.0 if clicked else 0.0
+        reward = base_reward - penalty
 
         # Блокируем доступ к arm_stats для атомарного обновления
         with self._lock:
             # Обновляем статистику коэффициента
-            stats = self.arm_stats[action]
+            stats = self.arm_stats[coefficient]
             stats['count'] += 1
             stats['total_reward'] += reward
             stats['avg_reward'] = stats['total_reward'] / stats['count']
@@ -185,13 +111,15 @@ class MultiArmedBandit:
             # Decay epsilon
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
-            logger.debug(
-                f"Coefficient {action} updated: ads={ads_watched}, penalty={penalty:.2f}, "
-                f"reward={reward:.2f}, avg_reward={stats['avg_reward']:.3f}, epsilon={self.epsilon:.3f}"
+            event_type = "CLICKED" if clicked else "IGNORED"
+            logger.info(
+                f"MAB update: coefficient={coefficient}, event={event_type}, "
+                f"penalty={penalty:.2f}, reward={reward:.2f}, "
+                f"avg_reward={stats['avg_reward']:.3f}, epsilon={self.epsilon:.3f}"
             )
 
             if self.total_pulls % 100 == 0:
-                logger.info(f"MAB updates: {self.total_pulls}, epsilon: {self.epsilon:.3f}, avg reward: {self.total_rewards/self.total_pulls:.3f}")
+                logger.info(f"MAB total updates: {self.total_pulls}, epsilon: {self.epsilon:.3f}, avg reward: {self.total_rewards/self.total_pulls:.3f}")
 
     def get_stats(self) -> Dict:
         """Возвращает статистику агента (thread-safe)"""
