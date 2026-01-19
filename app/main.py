@@ -83,8 +83,6 @@ async def handle_init_event(event: InitEvent):
     if reward_source == "uplift":
         key = str(event.appmetrica_device_id) + "_" + str(event.session_id)
         session_init_data[key] = event.model_dump()
-        #session_init_data[event.session_id] = event.model_dump()
-        print(session_init_data)
 
     if reward_source == "mab":
         # MAB выбирает коэффициент
@@ -178,7 +176,6 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
         # Получаем init_data для uplift модели
         key = str(event.appmetrica_device_id) + "_" + str(event.session_id)
         init_data = session_init_data.get(key, {})
-        print(init_data)
         state = event.model_dump() | init_data
         fe_state = state_fe_standart(state)
 
