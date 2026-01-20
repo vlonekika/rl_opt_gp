@@ -2,6 +2,7 @@ import numpy as np
 from typing import Dict
 import logging
 import threading
+from app.ml_tools import state_fe_standart
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +158,8 @@ class MultiArmedBandit:
 
 class LinUCB:
     """
-    Linear Upper Confidence Bound (LinUCB) - контекстный бандит.
-    Использует линейную модель для предсказания награды на основе контекста (состояния игрока).
+    Linear Upper Confidence Bound (LinUCB) - ко��текстный бандит.
+    Использует линейную модель д��я предсказания награды на основе контекста (состояния игрока).
 
     Для каждого коэффициента (arm) строится линейная модель:
     reward = theta^T * context
@@ -170,14 +171,14 @@ class LinUCB:
     def __init__(
         self,
         coefficients: list = None,
-        context_dim: int = 20,
+        context_dim: int = 30,
         alpha: float = 1.0,
         penalty_weight: float = 0.1
     ):
         """
         Args:
             coefficients: Список коэффициентов (arms)
-            context_dim: Размерность вектора контекста
+            context_dim: Размерность вектора контекста (30 фичей из CatBoost модели)
             alpha: Параметр exploration (чем выше, тем больше exploration)
             penalty_weight: Вес штрафа за высокие награды
         """
@@ -328,49 +329,61 @@ class LinUCB:
             }
 
     @staticmethod
-    def extract_context(snapshot: Dict) -> np.ndarray:
+    def extract_context(state: Dict) -> np.ndarray:
         """
-        Извлекает вектор контекста из UserSnapshotActiveState.
-
-        Выбираются наиболее важные признаки состояния игрока:
-        - game_minute: минута игры
-        - money_balance: баланс денег (нормализован)
-        - health_ratio: здоровье (0-1)
-        - damage, health, regen: характеристики персонажа (нормализованы)
-        - *_lvl: уровни прокачки (нормализованы)
-        - hardness_calculate: сложность игры (нормализован)
-        - player_dps: урон в секунду (нормализован)
-        - ad_cnt, death_cnt: счетчики рекламы и смертей
-        - kills_last_minute, boss_kills_last_minute: активность
-        - shop_activity_last_minute, upgrade_activity_last_minute: активность в магазине
+        Извлекает вектор контекста из полного state (init_data + snapshot).
+        Использует те же 30 фичей, что и CatBoost uplift модель.
 
         Args:
-            snapshot: Словарь с полями UserSnapshotActiveState
+            state: Объединенный словарь init_data | snapshot_data
 
         Returns:
-            Вектор контекста размерности 20
+            Вектор контекста размерности 30 (фичи из CatBoost модели)
         """
-        # Нормализация: логарифм для больших чисел, деление на константу для средних
+        # Применяем feature engineering из uplift модели
+        fe_state = state_fe_standart(state)
+
+        # Порядок фичей точно как в CatBoost модели:
+        # ['ad_cnt_to_game_minute', 'game_minute', 'ad_cnt_lifetime_to_inapp_cnt_lifetime',
+        #  'avg_ad_cnt_per_session_cnt', 'ad_cnt', 'ad_views_cnt', 'avg_playtime_lifetime',
+        #  'avg_ad_cnt_to_be', 'itemtoken_revenue_last_minute_to_itemtoken_ad_reward_calculate',
+        #  'hard_balance', 'health_lvl', 'critical_chance_lvl', 'money_balance',
+        #  'game_minute_to_avg_playtime_lifetime', 'itemtoken_revenue_last_minute',
+        #  'money_ad_reward_calculate', 'money_balance_to_money_ad_reward_calculate',
+        #  'playtime', 'health', 'itemtoken_balance', 'inapp_cnt', 'hardness_calculate',
+        #  'last_session_playtime', 'regen_lvl', 'sharpeningstone_balance', 'regen',
+        #  'hard_balance_to_hardness_calculate', 'global_death_count',
+        #  'money_revenue_last_minute_to_money_ad_reward_calculate', 'session_cnt_to_days_since_install']
+
         return np.array([
-            snapshot.get('game_minute', 0) / 100.0,  # Нормализуем по 100 минутам
-            np.log1p(snapshot.get('money_balance', 0)) / 10.0,  # log нормализация
-            snapshot.get('health_ratio', 0),  # Уже 0-1
-            np.log1p(snapshot.get('damage', 0)) / 5.0,
-            np.log1p(snapshot.get('health', 0)) / 5.0,
-            np.log1p(snapshot.get('regen', 0)) / 5.0,
-            snapshot.get('damage_lvl', 0) / 50.0,
-            snapshot.get('health_lvl', 0) / 50.0,
-            snapshot.get('regen_lvl', 0) / 50.0,
-            snapshot.get('speed_lvl', 0) / 50.0,
-            snapshot.get('critical_chance_lvl', 0) / 50.0,
-            snapshot.get('critical_mult_lvl', 0) / 50.0,
-            snapshot.get('last_boss', 0) / 100.0,
-            np.log1p(snapshot.get('hardness_calculate', 0)) / 5.0,
-            np.log1p(snapshot.get('player_dps', 0)) / 10.0,
-            snapshot.get('ad_cnt', 0) / 20.0,
-            snapshot.get('death_cnt', 0) / 10.0,
-            snapshot.get('kills_last_minute', 0) / 50.0,
-            snapshot.get('boss_kills_last_minute', 0) / 5.0,
-            (snapshot.get('shop_activity_last_minute', 0) +
-             snapshot.get('upgrade_activity_last_minute', 0)) / 10.0,
+            fe_state.get('ad_cnt_to_game_minute', 0.0),
+            fe_state.get('game_minute', 0.0),
+            fe_state.get('ad_cnt_lifetime_to_inapp_cnt_lifetime', 0.0),
+            fe_state.get('avg_ad_cnt_per_session_cnt', 0.0),
+            fe_state.get('ad_cnt', 0.0),
+            fe_state.get('ad_views_cnt', 0.0),
+            fe_state.get('avg_playtime_lifetime', 0.0),
+            fe_state.get('avg_ad_cnt_to_be', 0.0),
+            fe_state.get('itemtoken_revenue_last_minute_to_itemtoken_ad_reward_calculate', 0.0),
+            fe_state.get('hard_balance', 0.0),
+            fe_state.get('health_lvl', 0.0),
+            fe_state.get('critical_chance_lvl', 0.0),
+            fe_state.get('money_balance', 0.0),
+            fe_state.get('game_minute_to_avg_playtime_lifetime', 0.0),
+            fe_state.get('itemtoken_revenue_last_minute', 0.0),
+            fe_state.get('money_ad_reward_calculate', 0.0),
+            fe_state.get('money_balance_to_money_ad_reward_calculate', 0.0),
+            fe_state.get('game_minute', 0.0),  # playtime - используем game_minute как приближение
+            fe_state.get('health', 0.0),
+            fe_state.get('itemtoken_balance', 0.0),
+            fe_state.get('inapp_cnt', 0.0),
+            fe_state.get('hardness_calculate', 0.0),
+            fe_state.get('last_session_playtime', 0.0),
+            fe_state.get('regen_lvl', 0.0),
+            fe_state.get('sharpeningstone_balance', 0.0),
+            fe_state.get('regen', 0.0),
+            fe_state.get('hard_balance_to_hardness_calculate', 0.0),
+            fe_state.get('global_death_count', 0.0),
+            fe_state.get('money_revenue_last_minute_to_money_ad_reward_calculate', 0.0),
+            fe_state.get('session_cnt_to_days_since_install', 0.0),
         ], dtype=np.float64)

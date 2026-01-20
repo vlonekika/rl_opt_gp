@@ -28,9 +28,10 @@ app = FastAPI(
 
 # LinUCB контекстный бандит для оптимизации коэффициента награды за рекламу
 # Использует состояние игрока (контекст) для более точного подбора коэффициента
+# context_dim=30 - использует те же 30 фичей, что и uplift модель (через state_fe_standart)
 linucb_agent = LinUCB(
     coefficients=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-    context_dim=20,
+    context_dim=30,
     alpha=1.0,
     penalty_weight=0.1
 )
@@ -40,7 +41,8 @@ with open("app/ml_models_pkl/ad_model_drop_device.pkl", "rb") as file:
 
 ad_prob_model_features = ad_prob_model.feature_names_
 
-# Хранилище init_data для uplift группы: (appmetrica_device_id, session_id) -> init_event_data
+# Хранилище init_data для mab и uplift групп: (appmetrica_device_id, session_id) -> init_event_data
+# Нужно для feature engineering через state_fe_standart
 session_init_data: Dict[tuple, Dict] = {}
 
 # Хранилище контекстов для LinUCB: (appmetrica_device_id, session_id, PlayTimeMinutes) -> context_vector
@@ -83,11 +85,14 @@ async def handle_init_event(event: InitEvent):
     )
     reward_source = GROUPS[split_group_id]
 
-    # Сохраняем init_data для всех групп
+    # Сохраняем init_data для всех групп (нужны для mab и uplift)
     session_key = (event.appmetrica_device_id, event.session_id)
     session_init_data[session_key] = event.model_dump()
 
-    
+    # На init event всегда возвращаем дефолтный коэффициент 1.0
+    coefficient = 1.0
+    recommended_reward = 0  # На init нет базовой награды
+
     return AdRewardResponse(
         session_id=event.session_id,
         appmetrica_device_id=event.appmetrica_device_id,
@@ -114,8 +119,15 @@ async def handle_snapshot_event(event: UserSnapshotActiveState):
     reward_source = GROUPS[split_group_id]
 
     if reward_source == "mab":
-        # Извлекаем контекст из состояния игрока
-        context = LinUCB.extract_context(event.model_dump())
+        # Получаем init_data для LinUCB (нужны те же фичи что в uplift)
+        session_key = (event.appmetrica_device_id, event.session_id)
+        init_data = session_init_data.get(session_key, {})
+
+        # Объединяем init_data и snapshot для полного state
+        state = event.model_dump() | init_data
+
+        # Извлекаем контекст из полного state (применяется state_fe_standart)
+        context = LinUCB.extract_context(state)
 
         # Сохраняем контекст с ключом (appmetrica_device_id, session_id, game_minute)
         # game_minute будет использован для сопоставления с PlayTimeMinutes в reward событии
