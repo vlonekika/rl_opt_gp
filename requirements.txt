@@ -4,3 +4,4 @@ pydantic==2.10.5
 numpy==2.2.1
 python-multipart==0.0.20
 catboost==1.2.8
+boto3==1.35.94

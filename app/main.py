@@ -3,10 +3,13 @@ from typing import Dict
 import logging
 from datetime import datetime
 import pickle
+from pathlib import Path
+import os
 
 from catboost import CatBoostClassifier, Pool
 from app.ml_tools import state_fe_standart, reward
 from app.ab_user_splitter import user_splitter
+from app.s3_storage import S3CheckpointStorage
 
 from app.models import InitEvent, UserSnapshotActiveState, RewardEvent, AdRewardResponse
 from app.rl_agent import LinUCB
@@ -29,12 +32,41 @@ app = FastAPI(
 # LinUCB контекстный бандит для оптимизации коэффициента награды за рекламу
 # Использует состояние игрока (контекст) для более точного подбора коэффициента
 # context_dim=30 - использует те же 30 фичей, что и uplift модель (через state_fe_standart)
-linucb_agent = LinUCB(
-    coefficients=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-    context_dim=30,
-    alpha=1.0,
-    penalty_weight=0.1
+
+# Настройка S3 storage для сохранения состояния агента
+s3_storage = S3CheckpointStorage(
+    bucket_name=os.getenv("S3_BUCKET"),  # Если не указан, S3 будет отключен
+    prefix="linucb_checkpoints",
+    enabled=os.getenv("S3_ENABLED", "true").lower() == "true"
 )
+
+# Временный файл для загрузки из S3 (удаляется после загрузки)
+TEMP_CHECKPOINT_PATH = "/tmp/linucb_agent.pkl"
+
+# Пытаемся загрузить сохраненное состояние из S3 при старте
+if s3_storage.exists():
+    logger.info("Trying to load LinUCB agent from S3...")
+    if s3_storage.download(TEMP_CHECKPOINT_PATH):
+        linucb_agent = LinUCB.load(TEMP_CHECKPOINT_PATH)
+        # Удаляем временный файл после загрузки
+        Path(TEMP_CHECKPOINT_PATH).unlink(missing_ok=True)
+        logger.info(f"LinUCB agent loaded from S3 (total_pulls={linucb_agent.total_pulls})")
+    else:
+        logger.info("Failed to load from S3, creating new LinUCB agent")
+        linucb_agent = LinUCB(
+            coefficients=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            context_dim=30,
+            alpha=1.0,
+            penalty_weight=0.1
+        )
+else:
+    logger.info("Creating new LinUCB agent (no checkpoint in S3)")
+    linucb_agent = LinUCB(
+        coefficients=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        context_dim=30,
+        alpha=1.0,
+        penalty_weight=0.1
+    )
 
 with open("app/ml_models_pkl/ad_model_drop_device.pkl", "rb") as file:
     ad_prob_model = pickle.load(file)
@@ -270,6 +302,37 @@ async def get_agent_stats():
         "linucb": linucb_agent.get_stats(),
         "session_contexts_count": len(session_contexts)
     }
+
+
+@app.post("/agent/save")
+async def save_agent():
+    """
+    Сохраняет текущее состояние LinUCB агента в S3.
+    Полезно для ручного создания checkpoint перед важными изменениями.
+    """
+    # Сохраняем во временный файл
+    linucb_agent.save(TEMP_CHECKPOINT_PATH)
+
+    # Загружаем в S3
+    s3_uploaded = s3_storage.upload(TEMP_CHECKPOINT_PATH)
+
+    # Удаляем временный файл
+    Path(TEMP_CHECKPOINT_PATH).unlink(missing_ok=True)
+
+    if s3_uploaded:
+        return {
+            "status": "ok",
+            "message": f"Agent saved to S3: s3://{s3_storage.bucket_name}/{s3_storage.prefix}/linucb_agent.pkl",
+            "total_pulls": linucb_agent.total_pulls,
+            "s3_enabled": True
+        }
+    else:
+        return {
+            "status": "warning",
+            "message": "S3 is disabled or upload failed. Agent state saved only in memory.",
+            "total_pulls": linucb_agent.total_pulls,
+            "s3_enabled": False
+        }
 
 
 if __name__ == "__main__":

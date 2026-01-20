@@ -2,6 +2,8 @@ import numpy as np
 from typing import Dict
 import logging
 import threading
+import pickle
+from pathlib import Path
 from app.ml_tools import state_fe_standart
 
 logger = logging.getLogger(__name__)
@@ -387,3 +389,67 @@ class LinUCB:
             fe_state.get('money_revenue_last_minute_to_money_ad_reward_calculate', 0.0),
             fe_state.get('session_cnt_to_days_since_install', 0.0),
         ], dtype=np.float64)
+
+    def save(self, filepath: str):
+        """
+        Сохраняет состояние агента на диск.
+
+        Args:
+            filepath: Путь к файлу для сохранения (например, 'checkpoints/linucb_agent.pkl')
+        """
+        with self._lock:
+            state = {
+                'arms': self.arms,
+                'n_arms': self.n_arms,
+                'context_dim': self.context_dim,
+                'alpha': self.alpha,
+                'penalty_weight': self.penalty_weight,
+                'A': self.A,
+                'b': self.b,
+                'theta': self.theta,
+                'arm_pulls': self.arm_pulls,
+                'total_pulls': self.total_pulls,
+                'total_rewards': self.total_rewards,
+            }
+
+            # Создаем директорию если не существует
+            Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+
+            with open(filepath, 'wb') as f:
+                pickle.dump(state, f)
+
+            logger.info(f"LinUCB agent saved to {filepath} (total_pulls={self.total_pulls})")
+
+    @classmethod
+    def load(cls, filepath: str) -> 'LinUCB':
+        """
+        Загружает состояние агента с диска.
+
+        Args:
+            filepath: Путь к файлу для загрузки
+
+        Returns:
+            Восстановленный LinUCB агент
+        """
+        with open(filepath, 'rb') as f:
+            state = pickle.load(f)
+
+        # Создаем новый экземпляр с параметрами из сохраненного состояния
+        agent = cls(
+            coefficients=state['arms'],
+            context_dim=state['context_dim'],
+            alpha=state['alpha'],
+            penalty_weight=state['penalty_weight']
+        )
+
+        # Восстанавливаем обученное состояние
+        agent.A = state['A']
+        agent.b = state['b']
+        agent.theta = state['theta']
+        agent.arm_pulls = state['arm_pulls']
+        agent.total_pulls = state['total_pulls']
+        agent.total_rewards = state['total_rewards']
+
+        logger.info(f"LinUCB agent loaded from {filepath} (total_pulls={agent.total_pulls})")
+
+        return agent
