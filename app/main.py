@@ -83,58 +83,19 @@ async def handle_init_event(event: InitEvent):
     )
     reward_source = GROUPS[split_group_id]
 
-    # Сохраняем init_data для uplift группы
-    if reward_source == "uplift":
-        session_key = (event.appmetrica_device_id, event.session_id)
-        session_init_data[session_key] = event.model_dump()
+    # Сохраняем init_data для всех групп
+    session_key = (event.appmetrica_device_id, event.session_id)
+    session_init_data[session_key] = event.model_dump()
 
-    if reward_source == "mab":
-        # Возвращаем дефолтное значение (будет обновлено при первом snapshot с контекстом)
-        coefficient = 1.0
-        default_reward = 1000
-        recommended_reward = int(coefficient * default_reward)
-
-        logger.info(
-            f"Session {event.session_id} initialized: coefficient={coefficient}, "
-            f"default_reward={default_reward}, recommended_reward={recommended_reward}"
-        )
-
-        return AdRewardResponse(
-            session_id=event.session_id,
-            appmetrica_device_id=event.appmetrica_device_id,
-            reward_source="mab",
-            recommended_coefficient=coefficient,
-            recommended_reward=recommended_reward,
-            game_minute=0
-        )
     
-    elif reward_source == "uplift":
-        default_reward = 1000
-        coefficient = 1
-        recommended_reward = int(coefficient * default_reward)
-
-        return AdRewardResponse(
-            session_id=event.session_id,
-            appmetrica_device_id=event.appmetrica_device_id,
-            reward_source="uplift",
-            recommended_coefficient=coefficient,
-            recommended_reward=recommended_reward,
-            game_minute=0
-        )
-    
-    elif reward_source == "default":
-        default_reward = 1000
-        coefficient = 1
-        recommended_reward = int(coefficient * default_reward)
-
-        return AdRewardResponse(
-            session_id=event.session_id,
-            appmetrica_device_id=event.appmetrica_device_id,
-            reward_source="default",
-            recommended_coefficient=coefficient,
-            recommended_reward=recommended_reward,
-            game_minute=0
-        )
+    return AdRewardResponse(
+        session_id=event.session_id,
+        appmetrica_device_id=event.appmetrica_device_id,
+        reward_source="default",
+        recommended_coefficient=coefficient,
+        recommended_reward=recommended_reward,
+        game_minute=0
+    )
 
 
 @app.post("/events/snapshot", response_model=AdRewardResponse)
